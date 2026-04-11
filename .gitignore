@@ -1,0 +1,20 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Screen snapshots — may contain sensitive screen content
+snapshots/
+
+# Runtime lock/pid files
+/tmp/sttts_capture.lock
+/tmp/sttts_capture.pid
+
+# Python version pin (machine-specific)
+.python-version
