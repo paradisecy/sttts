@@ -10,6 +10,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from html.parser import HTMLParser
@@ -131,6 +132,46 @@ def parse_args() -> argparse.Namespace:
         metavar="X,Y,W,H",
         help="'Next page' button region as x,y,width,height (skips slop selection)",
     )
+    parser.add_argument(
+        "--web",
+        action="store_true",
+        help="Web scroll mode: after TTS, Page_Down to the next portion; Arrow Down to nudge when old text is still visible",
+    )
+    parser.add_argument(
+        "--overlap-threshold",
+        type=float,
+        default=0.6,
+        metavar="RATIO",
+        help="Word overlap ratio above which the screen is considered to still show old text (web mode, 0–1)",
+    )
+    parser.add_argument(
+        "--save-mp3",
+        metavar="URL",
+        help="Fetch URL, synthesise all text with Kokoro, save as MP3 (no playback)",
+    )
+    parser.add_argument(
+        "--mp3-out",
+        type=Path,
+        metavar="FILE",
+        help="Output file for --save-mp3 (default: derived from page title, e.g. My_Article.mp3)",
+    )
+    parser.add_argument(
+        "--browser-url",
+        metavar="URL",
+        help="Browser-controlled mode: open URL in a browser, extract text from DOM, speak and auto-scroll (no OCR)",
+    )
+    parser.add_argument(
+        "--browser-headless",
+        action="store_true",
+        help="Hide the browser window in --browser-url mode (default: visible)",
+    )
+    parser.add_argument(
+        "--chunk-words",
+        type=int,
+        default=150,
+        metavar="N",
+        help="Words per spoken chunk in --browser-url mode",
+    )
     return parser.parse_args()
 
 
@@ -149,6 +190,27 @@ def click_center(region: dict) -> None:
     x = region["left"] + region["width"] // 2
     y = region["top"] + region["height"] // 2
     subprocess.run(["xdotool", "mousemove", str(x), str(y), "click", "1"], capture_output=True)
+
+
+def press_key_in_region(region: dict, key: str) -> None:
+    """Move the mouse into the region so the browser is under the cursor, then send a key."""
+    if not shutil.which("xdotool"):
+        print("Warning: xdotool not found, cannot send key.", file=sys.stderr)
+        return
+    x = region["left"] + region["width"] // 2
+    y = region["top"] + region["height"] // 2
+    subprocess.run(["xdotool", "mousemove", str(x), str(y)], capture_output=True)
+    time.sleep(0.05)
+    subprocess.run(["xdotool", "key", "--clearmodifiers", key], capture_output=True)
+
+
+def text_overlap_ratio(old_text: str, new_text: str) -> float:
+    """Fraction of new_text words that also appear in old_text."""
+    old_words = set(re.findall(r'\w+', old_text.lower()))
+    new_words = re.findall(r'\w+', new_text.lower())
+    if not new_words or not old_words:
+        return 0.0
+    return sum(1 for w in new_words if w in old_words) / len(new_words)
 
 
 def select_region(label: str = "capture") -> dict:
@@ -333,8 +395,263 @@ def _unduck(inputs: list[tuple[str, str]]) -> None:
                        capture_output=True)
 
 
+class _Seek(Exception):
+    """Raised from on_grapheme to jump to a specific element index."""
+    def __init__(self, idx: int):
+        self.idx = idx
+
+
+class _BrowserState:
+    """Thread-safe state shared between the main thread and Playwright's
+    background thread (where expose_function callbacks run)."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._paused = False
+        self._seek = -1          # -1 = no pending seek
+        self._resume = threading.Event()
+
+    # --- called from Playwright background thread ---
+
+    def on_pause(self):
+        with self._lock:
+            self._paused = True
+            self._resume.clear()
+        sd.stop()
+
+    def on_resume(self, seek_idx):
+        with self._lock:
+            self._paused = False
+            self._seek = int(seek_idx) if seek_idx is not None else -1
+        self._resume.set()
+
+    def on_navigate(self, seek_idx):
+        """Next / Previous — interrupt current audio and jump, keep playing."""
+        with self._lock:
+            self._seek = int(seek_idx)
+            self._paused = False   # ensure we stay playing after the jump
+        self._resume.set()         # unblock _check_interrupted if it was paused
+        sd.stop()                  # cut current audio chunk immediately
+
+    # --- called from main thread ---
+
+    def is_paused(self) -> bool:
+        with self._lock:
+            return self._paused
+
+    def has_seek(self) -> bool:
+        with self._lock:
+            return self._seek >= 0
+
+    def is_interrupted(self) -> bool:
+        """True when the chunk loop should stop (paused OR navigation pending)."""
+        with self._lock:
+            return self._paused or self._seek >= 0
+
+    def wait_resume(self, timeout: float = 0.5) -> bool:
+        return self._resume.wait(timeout=timeout)
+
+    def consume_seek(self) -> int:
+        with self._lock:
+            s = self._seek
+            self._seek = -1
+            return s
+
+
+def _inject_browser_ui(page) -> None:
+    """Inject CSS highlight rules + a fixed play/pause control bar."""
+    page.evaluate("""() => {
+        if (document.getElementById('sttts-style')) return;
+
+        // --- CSS ---
+        const style = document.createElement('style');
+        style.id = 'sttts-style';
+        style.textContent = `
+            [data-sttts-active] {
+                background: rgba(255, 250, 180, 0.55) !important;
+                outline: 2px solid #FFA500;
+                border-radius: 4px;
+            }
+            span.sttts-word {
+                background: #FFD700;
+                color: #000 !important;
+                border-radius: 3px;
+                padding: 0 2px;
+            }
+            #sttts-bar * { box-sizing: border-box; }
+        `;
+        document.head.appendChild(style);
+
+        // --- Control bar ---
+        const bar = document.createElement('div');
+        bar.id = 'sttts-bar';
+        bar.style.cssText = [
+            'position:fixed', 'top:0', 'left:0', 'right:0', 'z-index:2147483647',
+            'background:rgba(18,18,18,0.92)', 'color:#fff',
+            'padding:10px 20px', 'display:flex', 'align-items:center', 'gap:14px',
+            'font-family:-apple-system,BlinkMacSystemFont,sans-serif', 'font-size:14px',
+            'backdrop-filter:blur(10px)', 'box-shadow:0 2px 16px rgba(0,0,0,0.5)',
+        ].join(';');
+        const btnStyle = `
+            border:none; border-radius:20px; padding:7px 16px; cursor:pointer;
+            font-size:15px; font-weight:700; white-space:nowrap;
+            transition:background 0.2s, color 0.2s;
+        `;
+        bar.innerHTML = `
+            <button id="sttts-prev" style="${btnStyle} background:#444; color:#fff;">⏮ Prev</button>
+            <button id="sttts-btn"  style="${btnStyle} background:#FFD700; color:#000;">⏸ Pause</button>
+            <button id="sttts-next" style="${btnStyle} background:#444; color:#fff;">Next ⏭</button>
+            <span id="sttts-pos" style="opacity:0.65; white-space:nowrap; margin-left:8px;">Starting…</span>
+            <span style="margin-left:auto; opacity:0.35; font-size:11px; letter-spacing:2px; text-transform:uppercase;">sttts</span>
+        `;
+        document.body.prepend(bar);
+        document.body.style.marginTop = (bar.offsetHeight + 8) + 'px';
+
+        // --- Helpers ---
+        window._sttts_paused = false;
+
+        function setPlaying() {
+            window._sttts_paused = false;
+            const btn = document.getElementById('sttts-btn');
+            btn.textContent = '⏸ Pause';
+            btn.style.background = '#FFD700';
+            btn.style.color = '#000';
+        }
+        function setPaused() {
+            window._sttts_paused = true;
+            const btn = document.getElementById('sttts-btn');
+            btn.textContent = '▶ Resume';
+            btn.style.background = '#4CAF50';
+            btn.style.color = '#fff';
+        }
+        function currentIdx() {
+            const el = document.querySelector('[data-sttts-active]');
+            return el ? parseInt(el.getAttribute('data-sttts')) : 0;
+        }
+        function topVisibleIdx() {
+            let idx = -1;
+            document.querySelectorAll('[data-sttts]').forEach(el => {
+                if (idx >= 0) return;
+                const r = el.getBoundingClientRect();
+                if (r.bottom > 0 && r.top < window.innerHeight) {
+                    idx = parseInt(el.getAttribute('data-sttts'));
+                }
+            });
+            return idx;
+        }
+
+        // --- Pause / Resume ---
+        document.getElementById('sttts-btn').addEventListener('click', () => {
+            if (!window._sttts_paused) {
+                setPaused();
+                window.sttts_pause();
+            } else {
+                setPlaying();
+                window.sttts_resume(topVisibleIdx());
+            }
+        });
+
+        // --- Previous ---
+        document.getElementById('sttts-prev').addEventListener('click', () => {
+            setPlaying();
+            window.sttts_navigate(Math.max(0, currentIdx() - 1));
+        });
+
+        // --- Next ---
+        document.getElementById('sttts-next').addEventListener('click', () => {
+            setPlaying();
+            window.sttts_navigate(currentIdx() + 1);
+        });
+    }""")
+
+
+def _update_bar_status(page, text: str) -> None:
+    page.evaluate(
+        "t => { const el = document.getElementById('sttts-pos'); if (el) el.textContent = t; }",
+        text,
+    )
+
+
+def _check_interrupted(state: _BrowserState, is_stopped) -> int | None:
+    """Handle pause, resume-with-seek, and next/prev navigation.
+    Returns a seek element idx, or None to continue at the current position."""
+    if not state.is_paused() and not state.has_seek():
+        return None
+    if state.is_paused():
+        print("[paused]", flush=True)
+        while not is_stopped():
+            if state.wait_resume(timeout=0.5):
+                break
+        if is_stopped():
+            return None
+    seek = state.consume_seek()
+    if seek >= 0:
+        print(f"[seek → {seek}]", flush=True)
+    return seek if seek >= 0 else None
+
+
+def _activate_element(page, idx: int) -> None:
+    """Mark element idx as the currently reading element and scroll to it."""
+    page.evaluate("""idx => {
+        document.querySelectorAll('[data-sttts-active]').forEach(el => {
+            el.removeAttribute('data-sttts-active');
+        });
+        document.querySelectorAll('span.sttts-word').forEach(sp => {
+            sp.replaceWith(document.createTextNode(sp.textContent));
+        });
+        const el = document.querySelector(`[data-sttts="${idx}"]`);
+        if (!el) return;
+        el.setAttribute('data-sttts-active', '1');
+        el.scrollIntoView({behavior: 'smooth', block: 'center'});
+    }""", idx)
+
+
+def _highlight_word(page, idx: int, phrase: str) -> None:
+    """Highlight a specific phrase within element idx (scoped search — always matches)."""
+    page.evaluate("""([idx, phrase]) => {
+        const container = document.querySelector(`[data-sttts="${idx}"]`);
+        if (!container || !phrase) return;
+
+        // Remove previous word highlight within this element only
+        container.querySelectorAll('span.sttts-word').forEach(sp => {
+            sp.replaceWith(document.createTextNode(sp.textContent));
+        });
+        container.normalize();
+
+        // Walk text nodes inside this element
+        const walk = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+        let n;
+        while ((n = walk.nextNode())) {
+            const i = n.textContent.indexOf(phrase);
+            if (i < 0) continue;
+            const end = Math.min(i + phrase.length, n.textContent.length);
+            try {
+                const r = document.createRange();
+                r.setStart(n, i);
+                r.setEnd(n, end);
+                const sp = document.createElement('span');
+                sp.className = 'sttts-word';
+                r.surroundContents(sp);
+            } catch(e) {}
+            return;
+        }
+    }""", [idx, phrase])
+
+
+def _clear_browser_highlights(page) -> None:
+    page.evaluate("""() => {
+        document.querySelectorAll('[data-sttts-active]').forEach(el => {
+            el.removeAttribute('data-sttts-active');
+        });
+        document.querySelectorAll('span.sttts-word').forEach(sp => {
+            sp.replaceWith(document.createTextNode(sp.textContent));
+        });
+        document.body.normalize();
+    }""")
+
+
 def load_tts(voice: str, speed: float):
-    """Load Kokoro TTS pipeline on CPU; return callable speak(text)."""
+    """Load Kokoro TTS pipeline on CPU; return callable speak(text, ...)."""
     import torch
     from kokoro import KPipeline
 
@@ -342,15 +659,35 @@ def load_tts(voice: str, speed: float):
     with torch.device("cpu"):
         pipeline = KPipeline(lang_code="a", device="cpu")
 
-    def speak(text: str) -> None:
+    def speak(text: str, on_grapheme=None, pump=None, pause_state=None) -> None:
+        """
+        on_grapheme: called with each grapheme string before its audio plays.
+        pump:        called between 200ms audio chunks — pumps Playwright's event
+                     queue so expose_function callbacks (pause/resume) are delivered.
+        pause_state: _BrowserState instance; if set, chunk playback stops when paused.
+        """
         if not text.strip():
             return
         others = _get_sink_inputs()
         _duck(others)
         try:
-            for _, _, audio in pipeline(text, voice=voice, speed=speed):
-                sd.play(audio, samplerate=24000)
-                sd.wait()
+            CHUNK = int(24000 * 0.2)  # 200 ms per chunk
+            for gs, _, audio in pipeline(text, voice=voice, speed=speed):
+                if on_grapheme is not None and gs and gs.strip():
+                    on_grapheme(gs.strip())
+                if pause_state is not None:
+                    i = 0
+                    while i < len(audio):
+                        if pause_state.is_interrupted():
+                            break
+                        sd.play(audio[i:i + CHUNK], samplerate=24000)
+                        sd.wait()
+                        if pump is not None:
+                            pump()   # lets Playwright deliver queued callbacks
+                        i += CHUNK
+                else:
+                    sd.play(audio, samplerate=24000)
+                    sd.wait()
         finally:
             _unduck(others)
 
@@ -378,6 +715,8 @@ def capture_loop(
     diff_threshold: float,
     speak,
     next_btn_region: dict | None,
+    web_scroll: bool = False,
+    overlap_threshold: float = 0.6,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -407,8 +746,9 @@ def capture_loop(
     count = 0
     last_file: Path | None = None
     prev_pixels: np.ndarray | None = None
-    # True after TTS finishes speaking — so next idle frame triggers a page turn
     waiting_for_next_page = False
+    last_spoken: str = ""
+    nudge_count: int = 0
 
     with mss.mss() as sct:
         while not stop:
@@ -436,9 +776,15 @@ def capture_loop(
                     if waiting_for_next_page and next_btn_region:
                         print(f"[{count:>4}] idle after TTS — clicking next-page button")
                         click_center(next_btn_region)
-                        # Reset so we OCR the new page fresh
                         prev_pixels = None
                         waiting_for_next_page = False
+                        nudge_count = 0
+                    elif waiting_for_next_page and web_scroll:
+                        print(f"[{count:>4}] idle after TTS — pressing Page_Down")
+                        press_key_in_region(region, "Page_Down")
+                        prev_pixels = None
+                        waiting_for_next_page = False
+                        nudge_count = 0
                     else:
                         print(f"[{count:>4}] {changed_pct:.2f}% changed — idle, skipping OCR")
                         prev_pixels = curr_pixels
@@ -464,9 +810,25 @@ def capture_loop(
                 if speak is not None and text.strip():
                     speakable = to_speakable(text)
                     if speakable:
+                        # Web mode: nudge down if old text is still largely visible
+                        if web_scroll and last_spoken and nudge_count < 20:
+                            overlap = text_overlap_ratio(last_spoken, speakable)
+                            if overlap > overlap_threshold:
+                                print(f"[web] {overlap:.0%} overlap with last spoken — nudging Arrow Down")
+                                for _ in range(3):
+                                    press_key_in_region(region, "Down")
+                                    time.sleep(0.1)
+                                prev_pixels = None
+                                nudge_count += 1
+                                deadline = time.monotonic() + interval
+                                while not stop and time.monotonic() < deadline:
+                                    time.sleep(0.05)
+                                continue
+
                         speak(speakable)
-                        # TTS just finished — next idle frame should turn the page
-                        if next_btn_region:
+                        last_spoken = speakable
+                        nudge_count = 0
+                        if next_btn_region or web_scroll:
                             waiting_for_next_page = True
 
             deadline = time.monotonic() + interval
@@ -474,6 +836,247 @@ def capture_loop(
                 time.sleep(0.05)
 
     print(f"\nStopped. {count} snapshot(s) taken.")
+
+
+def _group_chunks(paragraphs: list[str], max_words: int) -> list[str]:
+    chunks: list[str] = []
+    current: list[str] = []
+    current_words = 0
+    for para in paragraphs:
+        words = len(para.split())
+        if current and current_words + words > max_words:
+            chunks.append(" ".join(current))
+            current, current_words = [para], words
+        else:
+            current.append(para)
+            current_words += words
+    if current:
+        chunks.append(" ".join(current))
+    return chunks
+
+
+def browser_reader_loop(url: str, speak, chunk_words: int, headless: bool) -> None:
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print(
+            "playwright not installed. Run:\n"
+            "  uv add playwright && uv run playwright install chromium",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    stop = False
+
+    def _handle_signal(sig, frame):
+        nonlocal stop
+        stop = True
+        sd.stop()
+
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless)
+        page = browser.new_page()
+
+        # Expose Python callbacks so browser button can drive them directly.
+        # These run in Playwright's background thread — _BrowserState is thread-safe.
+        bs = _BrowserState()
+        page.expose_function("sttts_pause",    bs.on_pause)
+        page.expose_function("sttts_resume",   bs.on_resume)
+        page.expose_function("sttts_navigate", bs.on_navigate)
+
+        print(f"Opening {url} …")
+        try:
+            page.goto(url, wait_until="networkidle", timeout=30_000)
+        except Exception as e:
+            print(f"Error loading page: {e}", file=sys.stderr)
+            browser.close()
+            return
+
+        # Tag every readable block element with a data-sttts index and
+        # return its text directly from the DOM — no external extractor needed.
+        elements = page.evaluate("""() => {
+            const SKIP = el => !!el.closest(
+                'nav, header, footer, aside, [role=navigation], [role=banner], [role=complementary]'
+            );
+            const results = [];
+            let idx = 0;
+            const sel = 'p, h1, h2, h3, h4, h5, h6, li, blockquote';
+            document.querySelectorAll(sel).forEach(el => {
+                if (SKIP(el)) return;
+                const text = (el.innerText || '').trim();
+                if (text.length < 20) return;
+                el.setAttribute('data-sttts', idx);
+                results.push({idx: idx++, text});
+            });
+            return results;
+        }""")
+
+        if not elements:
+            print("No readable content found on this page.", file=sys.stderr)
+            browser.close()
+            return
+
+        print(f"Found {len(elements)} readable elements.")
+        print("Press Ctrl+C to stop.\n")
+
+        _inject_browser_ui(page)
+
+        def pump():
+            """Trivial Playwright call that flushes any queued expose_function callbacks."""
+            try:
+                page.evaluate("() => null")
+            except Exception:
+                pass
+
+        cursor = 0  # index into elements list
+        while not stop and cursor < len(elements):
+            el   = elements[cursor]
+            idx  = el["idx"]
+            text = el["text"]
+            preview = text[:80] + ("…" if len(text) > 80 else "")
+            print(f"\n[{idx + 1}/{len(elements)}] {preview}")
+
+            _activate_element(page, idx)
+            _update_bar_status(page, f"{idx + 1} / {len(elements)}")
+
+            if speak is None:
+                cursor += 1
+                continue
+
+            try:
+                def on_grapheme(phrase, _idx=idx):
+                    _highlight_word(page, _idx, phrase)
+                    seek = _check_interrupted(bs, lambda: stop)
+                    if seek is not None and seek != _idx:
+                        raise _Seek(seek)
+
+                speak(text, on_grapheme=on_grapheme, pump=pump, pause_state=bs)
+
+                # Catch interrupts on the last audio chunk of this element
+                seek = _check_interrupted(bs, lambda: stop)
+                if seek is not None and seek != idx:
+                    raise _Seek(seek)
+
+                cursor += 1
+
+            except _Seek as s:
+                target = next(
+                    (i for i, e in enumerate(elements) if e["idx"] >= s.idx),
+                    len(elements),
+                )
+                print(f"[seek] → element {s.idx} (list pos {target})", flush=True)
+                cursor = target
+
+        _clear_browser_highlights(page)
+        _update_bar_status(page, "Done")
+        if not stop:
+            print("\nFinished reading the page.")
+        browser.close()
+
+
+def save_mp3_loop(url: str, out: Path | None, voice: str, speed: float) -> None:
+    """Fetch a web page, synthesise all readable text with Kokoro, save as MP3."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("playwright not installed. Run: uv add playwright && uv run playwright install chromium", file=sys.stderr)
+        sys.exit(1)
+
+    import soundfile as sf
+    import torch
+    from kokoro import KPipeline
+
+    # ── 1. Extract text from page ─────────────────────────────────────────────
+    print(f"Fetching {url} …")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        try:
+            page.goto(url, wait_until="networkidle", timeout=30_000)
+        except Exception as e:
+            print(f"Error loading page: {e}", file=sys.stderr)
+            browser.close()
+            return
+
+        title = page.title() or "audio"
+        elements = page.evaluate("""() => {
+            const SKIP = el => !!el.closest(
+                'nav, header, footer, aside, [role=navigation], [role=banner], [role=complementary]'
+            );
+            const results = [];
+            document.querySelectorAll('p, h1, h2, h3, h4, h5, h6, li, blockquote').forEach(el => {
+                if (SKIP(el)) return;
+                const text = (el.innerText || '').trim();
+                if (text.length >= 20) results.push(text);
+            });
+            return results;
+        }""")
+        browser.close()
+
+    if not elements:
+        print("No readable text found on this page.", file=sys.stderr)
+        return
+
+    # ── 2. Resolve output path ────────────────────────────────────────────────
+    if out is None:
+        safe = re.sub(r'[^\w\s-]', '', title).strip()
+        safe = re.sub(r'\s+', '_', safe)[:60] or "audio"
+        out = Path(f"{safe}.mp3")
+
+    wav_path = out.with_suffix('.wav')
+
+    # ── 3. Load TTS ───────────────────────────────────────────────────────────
+    print(f"Loading TTS (voice={voice}, speed={speed})…")
+    with torch.device("cpu"):
+        pipeline = KPipeline(lang_code="a", device="cpu")
+
+    # ── 4. Synthesise and write WAV incrementally ─────────────────────────────
+    total = len(elements)
+    total_samples = 0
+    print(f"Synthesising {total} paragraphs → {out}\n")
+
+    try:
+        with sf.SoundFile(str(wav_path), mode='w', samplerate=24000, channels=1, subtype='PCM_16') as wav:
+            for i, text in enumerate(elements):
+                preview = text[:70] + ('…' if len(text) > 70 else '')
+                print(f"[{i + 1:>4}/{total}] {preview}", flush=True)
+                for _, _, audio in pipeline(text, voice=voice, speed=speed):
+                    wav.write(audio)
+                    total_samples += len(audio)
+    except KeyboardInterrupt:
+        print("\nInterrupted — partial WAV saved.", file=sys.stderr)
+
+    duration = total_samples / 24_000
+    h, rem = divmod(int(duration), 3600)
+    m, s   = divmod(rem, 60)
+    dur_str = (f"{h}h " if h else "") + f"{m:02d}m {s:02d}s"
+    print(f"\nDuration: {dur_str}")
+
+    # ── 5. Convert WAV → MP3 via ffmpeg ───────────────────────────────────────
+    if out.suffix.lower() == '.mp3':
+        if shutil.which('ffmpeg'):
+            print("Converting to MP3…")
+            res = subprocess.run(
+                ['ffmpeg', '-y', '-i', str(wav_path),
+                 '-codec:a', 'libmp3lame', '-qscale:a', '2', str(out)],
+                capture_output=True,
+            )
+            if res.returncode == 0:
+                wav_path.unlink()
+                size_kb = out.stat().st_size // 1024
+                print(f"Saved: {out}  ({size_kb:,} KB)")
+                return
+            else:
+                print("ffmpeg conversion failed; keeping WAV.", file=sys.stderr)
+                print(res.stderr.decode(errors='replace'), file=sys.stderr)
+        else:
+            print("ffmpeg not found — saved as WAV instead. Install ffmpeg for MP3 output.")
+
+    size_kb = wav_path.stat().st_size // 1024
+    print(f"Saved: {wav_path}  ({size_kb:,} KB)")
 
 
 LOCKFILE = Path("/tmp/sttts_capture.lock")
@@ -525,6 +1128,29 @@ def main() -> None:
 
     if args.list_monitors:
         list_monitors()
+        return
+
+    # Save-to-MP3 mode — headless, no playback
+    if args.save_mp3:
+        save_mp3_loop(
+            url=args.save_mp3,
+            out=args.mp3_out,
+            voice=args.voice,
+            speed=args.tts_speed,
+        )
+        return
+
+    # Browser-controlled mode — no screen capture, no OCR
+    if args.browser_url:
+        speak = None
+        if not args.no_tts:
+            speak = load_tts(voice=args.voice, speed=args.tts_speed)
+        browser_reader_loop(
+            url=args.browser_url,
+            speak=speak,
+            chunk_words=args.chunk_words,
+            headless=args.browser_headless,
+        )
         return
 
     # Determine capture region
@@ -585,6 +1211,8 @@ def main() -> None:
         diff_threshold=args.diff_threshold,
         speak=speak,
         next_btn_region=next_btn_region,
+        web_scroll=args.web,
+        overlap_threshold=args.overlap_threshold,
     )
 
 

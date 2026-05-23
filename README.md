@@ -2,7 +2,13 @@
 
 > **Your screen, read aloud. Entirely local. No cloud. No keys. Just your GPU and your voice.**
 
-**sttts** watches any region of your screen, understands what's on it using state-of-the-art OCR, and speaks it through your speakers in real time — powered by local AI models running on your own hardware.
+**sttts** has three modes — screen capture, browser reader, and MP3 export — all powered by local AI models on your own hardware.
+
+---
+
+## ✨ Modes
+
+### 1 — Screen capture (original)
 
 ```
 🖥️  screen region  →  🔍 pixel diff  →  🧠 OCR  →  ✨ clean text  →  🗣️ TTS  →  🔊 speaker
@@ -10,78 +16,119 @@
                           idle)                         stripped)
 ```
 
+Draw a rectangle on any part of your screen. sttts OCRs it every N seconds and speaks what changed.
+
+### 2 — Browser reader (`--browser-url`)
+
+```
+🌐 URL  →  🎭 Playwright  →  📄 DOM text  →  🗣️ TTS  →  🔊 speaker
+                                               ↕
+                                        🖱️ live scroll + word highlight
+```
+
+Open a URL in a visible browser, extract clean text directly from the DOM, speak it paragraph by paragraph with live word highlighting and auto-scroll. Floating control bar for play/pause and navigation.
+
+### 3 — MP3 export (`--save-mp3`)
+
+```
+🌐 URL  →  🎭 Playwright (headless)  →  📄 DOM text  →  🗣️ TTS  →  💾 MP3 file
+```
+
+Batch convert any web page to an MP3 file. No playback — just a file you can copy to your phone or MP3 player.
+
 ---
 
-## ✨ What it does
+## 📖 Auto page-turn (screen capture mode)
 
-1. 🖱️ **Draw** a rectangle on any part of your screen
-2. 📸 **Capture** a snapshot every N seconds
-3. 🔍 **Detect** whether anything actually changed (pixel diff)
-4. 🧠 **Read** the text with LightOnOCR-2-1B running on your GPU
-5. 🧹 **Clean** the output — tables, HTML, symbols all converted to natural language
-6. 🗣️ **Speak** it with Kokoro-82M, a high-quality local TTS model
-
-### 📖 Auto page-turn mode
-
-Point it at Kindle, an epub reader, or any paginated app. Draw a second rectangle over the **"next page"** button. After TTS finishes speaking a page and the screen stays idle, sttts automatically clicks the button and reads the next page — completely hands-free.
-
-### 💤 Smart idle detection
-
-Pixel-level diff comparison means OCR and TTS only fire when something **actually changed** on screen. Static content is silently skipped, keeping CPU/GPU usage low between updates.
-
----
-
-## 📚 Use case — Kindle for PC (hands-free audiobook)
-
-[![Demo — sttts reading Kindle hands-free](https://img.youtube.com/vi/nfkXIqK8Llg/maxresdefault.jpg)](https://youtu.be/nfkXIqK8Llg)
-
-Open Kindle for PC (or any ebook reader) on your screen. Run:
+Point it at Kindle, an epub reader, or any paginated app. Draw a second rectangle over the **"next page"** button. After TTS finishes and the screen goes idle, sttts clicks the button and reads the next page — completely hands-free.
 
 ```bash
 uv run python capture.py --next-btn -i 2
 ```
 
-**Step 1 — 🖱️ Draw the text area**
+### 🌐 Web scroll mode (`--web`)
 
-When prompted, drag a rectangle over the page text — the main reading area, excluding the toolbar and margins.
+Same screen-capture pipeline but instead of clicking a button, sttts presses `Page Down` after each spoken portion. If OCR finds too much overlap with the previous text it nudges with `Arrow Down` until fresh content appears.
 
-```
-┌─────────────────────────────────┐
-│         Kindle window           │
-│  ┌───────────────────────────┐  │
-│  │                           │  │
-│  │   ← select this area →    │  │
-│  │                           │  │
-│  │   Chapter 1               │  │
-│  │   It was a bright cold    │  │
-│  │   day in April...         │  │
-│  │                           │  │
-│  └───────────────────────────┘  │
-│              [>]                │
-└─────────────────────────────────┘
+```bash
+uv run python capture.py --web
 ```
 
-**Step 2 — 🖱️ Draw the next-page button**
+---
 
-When prompted a second time, drag a small rectangle over the next-page arrow `[>]`.
+## 🎭 Browser reader (`--browser-url`)
 
-**Step 3 — 🛋️ Sit back**
+Speak and follow along any web page with a live in-browser UI.
 
-sttts will:
+```bash
+uv run python capture.py --browser-url https://example.com/article
+```
 
-1. 🧠 OCR the current page
-2. 🗣️ Speak it aloud with Kokoro
-3. ⏳ Wait silently while speech plays
-4. 🖱️ Click the next-page button automatically
-5. 🔄 Wait for the new page to render
-6. 🔁 Repeat indefinitely — `Ctrl+C` to stop
+**What happens:**
+1. Opens the page in a visible Chromium window
+2. Tags every readable paragraph in the DOM with an index
+3. For each paragraph: scrolls to it, highlights it, speaks it with Kokoro
+4. Every Kokoro grapheme segment is highlighted word-by-word in real time
 
-**💡 Tips for Kindle**
+**Floating control bar** (injected at the top of the page):
 
-- Set Kindle to a **large font** and **high contrast** (white background, black text) for best OCR accuracy
-- Use `--diff-threshold 2` if Kindle's page-turn animation causes false triggers
-- Use `--voice af_heart --tts-speed 1.1` for a natural listening pace
-- Draw a slightly larger rectangle around the next-page button if clicks miss
+```
+⏮ Prev   ⏸ Pause   Next ⏭        paragraph 3 / 47        sttts
+```
+
+| Button | While playing | While paused |
+|---|---|---|
+| **⏮ Prev** | Jump to previous paragraph, keep playing | Jump to previous paragraph, resume playing |
+| **⏸ Pause** | Stop audio within ~200 ms | — |
+| **▶ Resume** | — | Resume from topmost visible paragraph (scroll first, then resume) |
+| **Next ⏭** | Jump to next paragraph, keep playing | Jump to next paragraph, resume playing |
+
+**Seek on resume:** while paused, scroll anywhere in the page, then click Resume — playback continues from the paragraph at the top of your viewport.
+
+```bash
+# Hidden browser (audio only)
+uv run python capture.py --browser-url https://example.com --browser-headless
+
+# Slower chunks, different voice
+uv run python capture.py --browser-url https://example.com --voice am_adam --tts-speed 1.1
+```
+
+---
+
+## 💾 MP3 export (`--save-mp3`)
+
+Convert an entire web page to an MP3 file for offline listening on a phone or MP3 player.
+
+```bash
+# Filename derived from page title automatically
+uv run python capture.py --save-mp3 https://example.com/article
+
+# Custom output path
+uv run python capture.py --save-mp3 https://example.com/article --mp3-out my-article.mp3
+
+# Faster voice
+uv run python capture.py --save-mp3 https://example.com/article --voice am_adam --tts-speed 1.15
+```
+
+**What happens:**
+1. Fetches the page headlessly (no visible window)
+2. Extracts readable paragraphs from the DOM (skips nav, header, footer, sidebars)
+3. Synthesises each paragraph with Kokoro, writing audio **incrementally** to a temp WAV (no memory spike for long articles)
+4. Converts WAV → MP3 via `ffmpeg -qscale:a 2` (high-quality VBR), deletes the temp WAV
+5. Falls back to WAV if `ffmpeg` is not installed
+
+Terminal output:
+```
+Fetching https://example.com/article …
+Loading TTS (voice=af_heart, speed=1.0)…
+Synthesising 47 paragraphs → My_Article.mp3
+
+[   1/47] It was the best of times, it was the worst of times…
+[   2/47] …
+Duration: 01h 12m 34s
+Converting to MP3…
+Saved: My_Article.mp3  (98,432 KB)
+```
 
 ---
 
@@ -120,18 +167,20 @@ sudo apt-get install -y \
     xdotool \
     libportaudio2 \
     libsndfile1 \
-    libasound2t64
+    libasound2t64 \
+    ffmpeg
 ```
 
 | Package | Purpose |
 |---|---|
 | `slop` | 🖱️ Mouse region selection — draw the capture rectangle |
-| `xdotool` | 🤖 Simulate mouse clicks for auto page-turn |
+| `xdotool` | 🤖 Simulate mouse clicks / key presses for auto scroll |
 | `libportaudio2` | 🔊 Audio backend for TTS playback |
 | `libsndfile1` | 🎵 Audio file I/O |
 | `libasound2t64` | 🔈 ALSA sound library |
+| `ffmpeg` | 🎞️ WAV → MP3 conversion for `--save-mp3` |
 
-### 🔴 AMD GPU / ROCm (optional but recommended)
+### 🔴 AMD GPU / ROCm (optional but recommended for screen-capture mode)
 
 Tested on **RX 7900 XTX**. Without ROCm, the OCR model runs on CPU (slower). Follow the [official ROCm install guide](https://rocm.docs.amd.com/en/latest/deploy/linux/index.html), then verify with `rocm-smi`.
 
@@ -143,67 +192,118 @@ Tested on **RX 7900 XTX**. Without ROCm, the OCR model runs on CPU (slower). Fol
 git clone <repo>
 cd sttts
 uv sync
+
+# Install Chromium for --browser-url and --save-mp3
+uv run playwright install chromium
 ```
 
 `uv sync` installs all Python dependencies:
 
-| Package | Version | Purpose |
-|---|---|---|
-| `torch` | 2.8.0+rocm6.3 | 🔥 Deep learning runtime (ROCm) |
-| `transformers` | latest | 🤗 LightOn OCR model loader |
-| `kokoro` | latest | 🗣️ Kokoro-82M TTS |
-| `mss` | latest | 📸 Fast screen capture |
-| `sounddevice` | latest | 🔊 Audio playback |
-| `numpy` / `pillow` | latest | 🖼️ Image processing |
+| Package | Purpose |
+|---|---|
+| `torch` 2.8.0+rocm6.3 | 🔥 Deep learning runtime (ROCm) |
+| `transformers` | 🤗 LightOn OCR model loader |
+| `kokoro` | 🗣️ Kokoro-82M TTS |
+| `playwright` | 🎭 Browser automation for `--browser-url` / `--save-mp3` |
+| `trafilatura` | 📰 Article text extraction (fallback) |
+| `mss` | 📸 Fast screen capture |
+| `sounddevice` | 🔊 Audio playback |
+| `soundfile` | 💾 WAV writing for `--save-mp3` |
+| `numpy` / `pillow` | 🖼️ Image processing |
 
 ---
 
 ## 🎮 Usage
 
 ```bash
-# 🟢 Basic: draw a region, capture + OCR + speak every 3s
+# ── Screen capture (OCR + TTS) ──────────────────────────────────────────────
+
+# Basic: draw a region, capture + OCR + speak every 3s
 uv run python capture.py
 
-# 📖 Auto page-turn: draw OCR region, then draw the next-page button
-uv run python capture.py --next-btn
+# Auto page-turn (Kindle, epub readers)
+uv run python capture.py --next-btn -i 2
 
-# ⚡ Faster interval, different voice
+# Web page scroll mode (Page Down after each spoken section)
+uv run python capture.py --web
+
+# Faster interval, different voice
 uv run python capture.py -i 1.5 --voice am_adam
 
-# 🔇 OCR only, no speech
+# OCR only (no speech), or capture only (no OCR)
 uv run python capture.py --no-tts
-
-# 📷 Capture only, no OCR
 uv run python capture.py --no-ocr
 
-# 📐 Skip mouse selection, use fixed coordinates
+# Fixed region (skip mouse selection)
 uv run python capture.py --region 100,200,800,600
+
+# ── Browser reader ───────────────────────────────────────────────────────────
+
+# Visible browser with play/pause/next/prev UI and word highlighting
+uv run python capture.py --browser-url https://example.com/article
+
+# Headless (audio only, no window)
+uv run python capture.py --browser-url https://example.com/article --browser-headless
+
+# ── MP3 export ───────────────────────────────────────────────────────────────
+
+# Save page as MP3 (filename from page title)
+uv run python capture.py --save-mp3 https://example.com/article
+
+# Custom output path
+uv run python capture.py --save-mp3 https://example.com/article --mp3-out chapter1.mp3
 ```
 
-### ⚙️ All options
+---
+
+## ⚙️ All options
+
+### Screen capture
 
 | Flag | Default | Description |
 |---|---|---|
 | `-i, --interval` | `3.0` | ⏱️ Seconds between captures |
-| `-o, --output-dir` | `snapshots/` | 📁 Directory for the current snapshot |
-| `-m, --monitor` | `1` | 🖥️ Monitor index (ignored when region is drawn) |
-| `--select` / `--no-select` | on | 🖱️ Draw region with mouse / use full monitor |
-| `--region X,Y,W,H` | — | 📐 Fixed capture region, skips mouse selection |
-| `--no-ocr` | off | 🚫 Disable OCR, capture images only |
-| `--model` | `lightonai/LightOnOCR-2-1B` | 🧠 HuggingFace OCR model ID |
-| `--prompt TEXT` | — | 💬 Optional prompt passed to the OCR model |
+| `-o, --output-dir` | `snapshots/` | 📁 Directory for snapshots |
+| `-m, --monitor` | `1` | 🖥️ Monitor index |
+| `--select` / `--no-select` | on | 🖱️ Draw region / use full monitor |
+| `--region X,Y,W,H` | — | 📐 Fixed capture region |
+| `--no-ocr` | off | 🚫 Capture images only |
+| `--model` | `lightonai/LightOnOCR-2-1B` | 🧠 HuggingFace OCR model |
+| `--prompt TEXT` | — | 💬 Prompt passed to the OCR model |
 | `--max-tokens` | `1024` | 🔢 Max tokens for OCR generation |
 | `--diff-threshold` | `1.0` | 🔍 Min % of changed pixels to trigger OCR |
-| `--no-tts` | off | 🔇 Disable text-to-speech |
-| `--voice` | `af_heart` | 🎙️ Kokoro voice (`af_heart`, `am_adam`, `bf_emma` …) |
-| `--tts-speed` | `1.0` | 🐇 TTS speech speed multiplier |
-| `--next-btn` | off | 📖 Draw a next-page button; auto-clicked when idle after TTS |
+| `--no-tts` | off | 🔇 Disable TTS |
+| `--next-btn` | off | 📖 Draw next-page button; auto-clicked when idle after TTS |
 | `--next-btn-region X,Y,W,H` | — | 📐 Fixed next-page button region |
+| `--web` | off | 🌐 Page Down after TTS; Arrow Down to find new content |
+| `--overlap-threshold` | `0.6` | 🔁 Max word overlap before nudging down (web mode) |
 | `--list-monitors` | — | 🖥️ Print available monitors and exit |
+
+### Voice (all modes)
+
+| Flag | Default | Description |
+|---|---|---|
+| `--voice` | `af_heart` | 🎙️ Kokoro voice (`af_heart`, `am_adam`, `bf_emma` …) |
+| `--tts-speed` | `1.0` | 🐇 Speech speed multiplier |
+
+### Browser reader (`--browser-url`)
+
+| Flag | Default | Description |
+|---|---|---|
+| `--browser-url URL` | — | 🌐 URL to open and read aloud |
+| `--browser-headless` | off | 🙈 Hide the browser window |
+| `--chunk-words` | `150` | 📏 Words per TTS chunk (unused in element-based mode) |
+
+### MP3 export (`--save-mp3`)
+
+| Flag | Default | Description |
+|---|---|---|
+| `--save-mp3 URL` | — | 💾 URL to convert to audio file |
+| `--mp3-out FILE` | page title | 📂 Output path (`.mp3` or `.wav`) |
 
 ---
 
-## ⚙️ How it works
+## ⚙️ How it works (screen capture)
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -213,13 +313,11 @@ uv run python capture.py --region 100,200,800,600
 │                                          │                      │
 │                               yes ◄──────┤──────► no            │
 │                                ▼                   ▼            │
-│                           🧠 OCR run         📖 next-btn set?   │
+│                           🧠 OCR run         📖 next-btn / web  │
 │                                ▼              yes ▼             │
-│                          ✨ clean text      🖱️ click & reset    │
+│                          ✨ clean text   🖱️ click or Page Down  │
 │                                ▼                                │
 │                          🗣️ Kokoro TTS ──► 🔊 speaker           │
-│                                ▼                                │
-│                    set ⏳ waiting_for_next_page                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 

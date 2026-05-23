@@ -8,9 +8,11 @@ dependencies = [
     "mss>=10.1.0",
     "numpy>=2.4.4",
     "pillow>=12.2.0",
-    "sounddevice>=0.5.5",
+    "playwright>=1.40.0",
+    "sounddevice>=0.5.1",
     "soundfile>=0.13.1",
     "torch==2.8.0+rocm6.3",
+    "trafilatura>=2.0.0",
     "transformers>=5.5.3",
 ]
 
