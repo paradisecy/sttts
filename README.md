@@ -2,7 +2,7 @@
 
 > **Your screen, read aloud. Entirely local. No cloud. No keys. Just your GPU and your voice.**
 
-**sttts** has three modes — screen capture, browser reader, and MP3 export — all powered by local AI models on your own hardware.
+**sttts** has four modes — screen capture, browser reader, MP3 export, and summarise — all powered by local AI models on your own hardware.
 
 ---
 
@@ -35,6 +35,18 @@ Open a URL in a visible browser, extract clean text directly from the DOM, speak
 ```
 
 Batch convert any web page to an MP3 file. No playback — just a file you can copy to your phone or MP3 player.
+
+### 4 — Summarise & read (`--summarize-url`)
+
+```
+🌐 URL  →  🎭 Playwright (headless)  →  📄 DOM text  →  🦙 Ollama LLM  →  📝 summary
+                                                                              ↓
+                                                                🎭 visible browser + 🗣️ TTS
+                                                                ⏸ play/pause/next/prev
+                                                                💾 Download MP3 button
+```
+
+Condense any web page with a local Ollama model, then read the summary aloud with the full browser reader UI and a one-click MP3 download button.
 
 ---
 
@@ -129,6 +141,41 @@ Duration: 01h 12m 34s
 Converting to MP3…
 Saved: My_Article.mp3  (98,432 KB)
 ```
+
+---
+
+## 🤖 Summarise & read (`--summarize-url`)
+
+```
+🌐 URL  →  🎭 Playwright (headless)  →  📄 DOM text  →  🦙 Ollama LLM  →  📝 summary HTML
+                                                                               ↓
+                                                                  🎭 visible browser
+                                                                  🗣️ TTS + word highlight
+                                                                  ⏸ play/pause/next/prev
+                                                                  💾 Download MP3 button
+```
+
+Fetch any web page, condense it to a readable summary using a **local Ollama model**, then open the summary in a visible browser with the full reader experience — word highlighting, play/pause/next/prev control bar, and a one-click Download MP3 button.
+
+```bash
+# Default model: llama3.2
+uv run python capture.py --summarize-url https://example.com/article
+
+# Different model
+uv run python capture.py --summarize-url https://example.com/article --summarize-model mistral
+
+# Combine with voice/speed options
+uv run python capture.py --summarize-url https://example.com/article --voice am_adam --tts-speed 1.1
+```
+
+**Requirements:** [Ollama](https://ollama.com) must be running locally (`ollama serve`) with the chosen model pulled (`ollama pull llama3.2`).
+
+**What happens:**
+1. Fetches the page headlessly and extracts readable text
+2. Streams the summary from Ollama token-by-token (visible in the terminal)
+3. Opens the formatted summary in a Chromium window
+4. Speaks it paragraph by paragraph with live word highlighting
+5. **Download MP3** button (green, in the control bar) — click once to start background synthesis; button updates as each paragraph is processed; shows `✅ filename.mp3` when done
 
 ---
 
@@ -252,6 +299,14 @@ uv run python capture.py --save-mp3 https://example.com/article
 
 # Custom output path
 uv run python capture.py --save-mp3 https://example.com/article --mp3-out chapter1.mp3
+
+# ── Summarise & read ─────────────────────────────────────────────────────────
+
+# Summarise page with llama3.2, open in browser, speak aloud
+uv run python capture.py --summarize-url https://example.com/article
+
+# Different Ollama model
+uv run python capture.py --summarize-url https://example.com/article --summarize-model mistral
 ```
 
 ---
@@ -300,6 +355,13 @@ uv run python capture.py --save-mp3 https://example.com/article --mp3-out chapte
 |---|---|---|
 | `--save-mp3 URL` | — | 💾 URL to convert to audio file |
 | `--mp3-out FILE` | page title | 📂 Output path (`.mp3` or `.wav`) |
+
+### Summarise & read (`--summarize-url`)
+
+| Flag | Default | Description |
+|---|---|---|
+| `--summarize-url URL` | — | 🤖 Summarise URL with Ollama, then speak in browser reader |
+| `--summarize-model MODEL` | `llama3.2` | 🦙 Ollama model name |
 
 ---
 

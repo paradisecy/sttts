@@ -172,6 +172,17 @@ def parse_args() -> argparse.Namespace:
         metavar="N",
         help="Words per spoken chunk in --browser-url mode",
     )
+    parser.add_argument(
+        "--summarize-url",
+        metavar="URL",
+        help="Fetch URL, summarise with a local Ollama model, then speak the summary with full reader UI",
+    )
+    parser.add_argument(
+        "--summarize-model",
+        default="llama3.2",
+        metavar="MODEL",
+        help="Ollama model to use for summarisation (default: llama3.2)",
+    )
     return parser.parse_args()
 
 
@@ -410,6 +421,13 @@ class _BrowserState:
         self._paused = False
         self._seek = -1          # -1 = no pending seek
         self._resume = threading.Event()
+        # download state (used by summarize_url_loop only)
+        self._dl_status = "idle"   # idle | working | done | error
+        self._dl_msg_pending = None
+        self._dl_texts: list = []
+        self._dl_voice = "af_heart"
+        self._dl_speed = 1.0
+        self._dl_title = ""
 
     # --- called from Playwright background thread ---
 
@@ -456,6 +474,92 @@ class _BrowserState:
             s = self._seek
             self._seek = -1
             return s
+
+    # --- download helpers (summarize_url_loop only) ---
+
+    def setup_download(self, texts: list, voice: str, speed: float, title: str) -> None:
+        with self._lock:
+            self._dl_texts = texts
+            self._dl_voice = voice
+            self._dl_speed = speed
+            self._dl_title = title
+            self._dl_status = "idle"
+            self._dl_msg_pending = None
+
+    def on_download(self) -> None:
+        """Called from Playwright background thread when Download button is clicked."""
+        with self._lock:
+            if self._dl_status != "idle":
+                return
+            self._dl_status = "working"
+            self._dl_msg_pending = "⏳ Synthesising…"
+        t = threading.Thread(target=self._dl_worker, daemon=True)
+        t.start()
+
+    def _dl_worker(self) -> None:
+        """Background thread: Kokoro → WAV → MP3. No Playwright calls allowed here."""
+        import soundfile as sf
+        import torch
+        from kokoro import KPipeline
+
+        with self._lock:
+            texts  = list(self._dl_texts)
+            voice  = self._dl_voice
+            speed  = self._dl_speed
+            title  = self._dl_title
+
+        safe = re.sub(r'[^\w\s-]', '', title).strip()
+        safe = re.sub(r'\s+', '_', safe)[:60] or "summary"
+        wav_path = Path(f"{safe}_summary.wav")
+        mp3_path = wav_path.with_suffix('.mp3')
+
+        def _set_msg(msg: str):
+            with self._lock:
+                self._dl_msg_pending = msg
+
+        try:
+            _set_msg("⏳ Loading TTS…")
+            with torch.device("cpu"):
+                pipeline = KPipeline(lang_code="a", device="cpu")
+
+            total = len(texts)
+            with sf.SoundFile(str(wav_path), mode='w', samplerate=24000, channels=1, subtype='PCM_16') as wav:
+                for i, text in enumerate(texts):
+                    _set_msg(f"⏳ {i + 1}/{total}…")
+                    for _, _, audio in pipeline(text, voice=voice, speed=speed):
+                        wav.write(audio)
+
+            if shutil.which('ffmpeg'):
+                _set_msg("⏳ Converting to MP3…")
+                res = subprocess.run(
+                    ['ffmpeg', '-y', '-i', str(wav_path),
+                     '-codec:a', 'libmp3lame', '-qscale:a', '2', str(mp3_path)],
+                    capture_output=True,
+                )
+                if res.returncode == 0:
+                    wav_path.unlink(missing_ok=True)
+                    size_kb = mp3_path.stat().st_size // 1024
+                    _set_msg(f"✅ {mp3_path.name} ({size_kb:,} KB)")
+                    with self._lock:
+                        self._dl_status = "done"
+                    return
+
+            size_kb = wav_path.stat().st_size // 1024
+            _set_msg(f"✅ {wav_path.name} ({size_kb:,} KB)")
+            with self._lock:
+                self._dl_status = "done"
+
+        except Exception as e:
+            with self._lock:
+                self._dl_status = "error"
+                self._dl_msg_pending = f"❌ {e}"
+
+    def check_download_update(self) -> str | None:
+        """Return pending button label (call from main thread). None if no update."""
+        with self._lock:
+            msg = self._dl_msg_pending
+            self._dl_msg_pending = None
+            return msg
 
 
 def _inject_browser_ui(page) -> None:
@@ -1079,6 +1183,264 @@ def save_mp3_loop(url: str, out: Path | None, voice: str, speed: float) -> None:
     print(f"Saved: {wav_path}  ({size_kb:,} KB)")
 
 
+def _ollama_summarize(text: str, model: str) -> str:
+    """Stream tokens from a local Ollama instance and return the full summary."""
+    import json
+    import urllib.request
+
+    prompt = (
+        "Summarize the following article in clear, readable paragraphs separated by blank lines. "
+        "Be concise but comprehensive. Plain text only — no markdown, no bullet points.\n\n"
+        + text[:12_000]
+    )
+    payload = json.dumps({"model": model, "prompt": prompt, "stream": True}).encode()
+    req = urllib.request.Request(
+        "http://localhost:11434/api/generate",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    parts: list[str] = []
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            for line in resp:
+                if not line.strip():
+                    continue
+                obj = json.loads(line)
+                token = obj.get("response", "")
+                print(token, end="", flush=True)
+                parts.append(token)
+                if obj.get("done"):
+                    break
+    except Exception as e:
+        raise RuntimeError(f"Ollama request failed: {e}") from e
+    print()
+    return "".join(parts)
+
+
+def _write_summary_html(title: str, url: str, model: str, paragraphs: list[str]) -> Path:
+    """Write a self-contained styled HTML file with data-sttts attributes. Returns path."""
+    import html as htmllib
+    import tempfile
+
+    paras_html = "\n".join(
+        f'  <p data-sttts="{i}">{htmllib.escape(p)}</p>'
+        for i, p in enumerate(paragraphs)
+    )
+    doc = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Summary: {htmllib.escape(title)}</title>
+<style>
+  body {{ font-family: Georgia, serif; max-width: 720px; margin: 80px auto 60px; padding: 0 24px; line-height: 1.75; color: #222; background: #fafaf8; }}
+  h1 {{ font-size: 1.45rem; margin-bottom: 4px; }}
+  .meta {{ font-size: 0.82rem; color: #888; margin-bottom: 32px; }}
+  p {{ margin: 0 0 1.2em; }}
+</style>
+</head>
+<body>
+<h1>Summary: {htmllib.escape(title)}</h1>
+<p class="meta">Summarized from <a href="{htmllib.escape(url)}">{htmllib.escape(url[:120])}</a> · model: {htmllib.escape(model)}</p>
+{paras_html}
+</body>
+</html>"""
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".html", delete=False, prefix="sttts_summary_", encoding="utf-8"
+    )
+    tmp.write(doc)
+    tmp.flush()
+    tmp.close()
+    return Path(tmp.name)
+
+
+def _inject_download_btn(page) -> None:
+    """Append a Download MP3 button to the sttts control bar."""
+    page.evaluate("""() => {
+        const bar = document.getElementById('sttts-bar');
+        if (!bar || document.getElementById('sttts-dl-btn')) return;
+        const btn = document.createElement('button');
+        btn.id = 'sttts-dl-btn';
+        btn.textContent = '💾 Download MP3';
+        btn.style.cssText = [
+            'margin-left:14px',
+            'padding:4px 14px',
+            'border:none',
+            'border-radius:4px',
+            'background:#27ae60',
+            'color:#fff',
+            'cursor:pointer',
+            'font-size:13px',
+            'font-weight:bold',
+        ].join(';');
+        btn.onclick = () => { window.sttts_download(); };
+        bar.appendChild(btn);
+    }""")
+
+
+def summarize_url_loop(url: str, model: str, speak, voice: str, speed: float) -> None:
+    """Fetch a URL, summarise with Ollama, open the summary in a visible browser and speak it."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("playwright not installed. Run: uv add playwright && uv run playwright install chromium", file=sys.stderr)
+        sys.exit(1)
+
+    stop = False
+
+    def _handle_signal(sig, frame):
+        nonlocal stop
+        stop = True
+        sd.stop()
+
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+
+    # ── 1. Fetch page text (headless) ─────────────────────────────────────────
+    print(f"Fetching {url} …")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        try:
+            page.goto(url, wait_until="networkidle", timeout=30_000)
+        except Exception as e:
+            print(f"Error loading page: {e}", file=sys.stderr)
+            browser.close()
+            return
+        title = page.title() or "Page"
+        raw_texts = page.evaluate("""() => {
+            const SKIP = el => !!el.closest(
+                'nav, header, footer, aside, [role=navigation], [role=banner], [role=complementary]'
+            );
+            const out = [];
+            document.querySelectorAll('p, h1, h2, h3, h4, h5, h6, li, blockquote').forEach(el => {
+                if (SKIP(el)) return;
+                const t = (el.innerText || '').trim();
+                if (t.length >= 20) out.push(t);
+            });
+            return out;
+        }""")
+        browser.close()
+
+    if not raw_texts:
+        print("No readable text found on this page.", file=sys.stderr)
+        return
+
+    full_text = "\n\n".join(raw_texts)
+    print(f"Extracted {len(raw_texts)} elements ({len(full_text):,} chars).")
+
+    # ── 2. Summarise with Ollama ──────────────────────────────────────────────
+    print(f"\nSummarising with {model} …\n")
+    try:
+        summary = _ollama_summarize(full_text, model)
+    except RuntimeError as e:
+        print(f"\n{e}", file=sys.stderr)
+        print("Is Ollama running?  Start it with: ollama serve", file=sys.stderr)
+        return
+
+    paragraphs = [p.strip() for p in re.split(r'\n\n+', summary) if p.strip()]
+    if not paragraphs:
+        paragraphs = [summary.strip()]
+    print(f"\n{len(paragraphs)} paragraphs in summary.\n")
+
+    # ── 3. Write temp HTML and open in visible browser ────────────────────────
+    html_path = _write_summary_html(title, url, model, paragraphs)
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=False)
+            page = browser.new_page()
+            page.goto(f"file://{html_path}", wait_until="networkidle", timeout=15_000)
+
+            bs = _BrowserState()
+            page.expose_function("sttts_pause",    bs.on_pause)
+            page.expose_function("sttts_resume",   bs.on_resume)
+            page.expose_function("sttts_navigate", bs.on_navigate)
+            page.expose_function("sttts_download", bs.on_download)
+
+            # Read elements back from the HTML we wrote (already tagged)
+            elements = page.evaluate("""() =>
+                Array.from(document.querySelectorAll('[data-sttts]')).map(el => ({
+                    idx:  parseInt(el.getAttribute('data-sttts')),
+                    text: (el.innerText || '').trim(),
+                })).filter(e => e.text.length > 0)
+            """)
+
+            if not elements:
+                print("Summary HTML has no readable elements.", file=sys.stderr)
+                browser.close()
+                return
+
+            _inject_browser_ui(page)
+            bs.setup_download(
+                texts=[e["text"] for e in elements],
+                voice=voice,
+                speed=speed,
+                title=title,
+            )
+            _inject_download_btn(page)
+
+            def pump():
+                try:
+                    page.evaluate("() => null")
+                except Exception:
+                    pass
+                msg = bs.check_download_update()
+                if msg:
+                    try:
+                        import json as _json
+                        page.evaluate(
+                            f"() => {{ const b = document.getElementById('sttts-dl-btn'); if (b) b.textContent = {_json.dumps(msg)}; }}"
+                        )
+                    except Exception:
+                        pass
+
+            print(f"Reading {len(elements)} paragraphs. Press Ctrl+C to stop.\n")
+            cursor = 0
+            while not stop and cursor < len(elements):
+                el    = elements[cursor]
+                idx   = el["idx"]
+                text  = el["text"]
+                preview = text[:80] + ("…" if len(text) > 80 else "")
+                print(f"\n[{idx + 1}/{len(elements)}] {preview}")
+
+                _activate_element(page, idx)
+                _update_bar_status(page, f"{idx + 1} / {len(elements)}")
+
+                if speak is None:
+                    cursor += 1
+                    continue
+
+                try:
+                    def on_grapheme(phrase, _idx=idx):
+                        _highlight_word(page, _idx, phrase)
+                        seek = _check_interrupted(bs, lambda: stop)
+                        if seek is not None and seek != _idx:
+                            raise _Seek(seek)
+
+                    speak(text, on_grapheme=on_grapheme, pump=pump, pause_state=bs)
+
+                    seek = _check_interrupted(bs, lambda: stop)
+                    if seek is not None and seek != idx:
+                        raise _Seek(seek)
+
+                    cursor += 1
+
+                except _Seek as s:
+                    target = next(
+                        (i for i, e in enumerate(elements) if e["idx"] >= s.idx),
+                        len(elements),
+                    )
+                    print(f"[seek] → element {s.idx} (list pos {target})", flush=True)
+                    cursor = target
+
+            _clear_browser_highlights(page)
+            _update_bar_status(page, "Done")
+            if not stop:
+                print("\nFinished reading summary.")
+            browser.close()
+    finally:
+        html_path.unlink(missing_ok=True)
+
+
 LOCKFILE = Path("/tmp/sttts_capture.lock")
 
 
@@ -1135,6 +1497,20 @@ def main() -> None:
         save_mp3_loop(
             url=args.save_mp3,
             out=args.mp3_out,
+            voice=args.voice,
+            speed=args.tts_speed,
+        )
+        return
+
+    # Summarise-URL mode — Ollama summary → visible browser reader
+    if args.summarize_url:
+        speak = None
+        if not args.no_tts:
+            speak = load_tts(voice=args.voice, speed=args.tts_speed)
+        summarize_url_loop(
+            url=args.summarize_url,
+            model=args.summarize_model,
+            speak=speak,
             voice=args.voice,
             speed=args.tts_speed,
         )
