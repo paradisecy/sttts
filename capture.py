@@ -179,9 +179,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--summarize-model",
-        default="llama3.2",
+        default="qwen3.5:latest",
         metavar="MODEL",
-        help="Ollama model to use for summarisation (default: llama3.2)",
+        help="Ollama model to use for summarisation (default: qwen3.5:latest)",
     )
     return parser.parse_args()
 

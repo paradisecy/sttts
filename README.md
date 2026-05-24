@@ -158,7 +158,7 @@ Saved: My_Article.mp3  (98,432 KB)
 Fetch any web page, condense it to a readable summary using a **local Ollama model**, then open the summary in a visible browser with the full reader experience — word highlighting, play/pause/next/prev control bar, and a one-click Download MP3 button.
 
 ```bash
-# Default model: llama3.2
+# Default model: qwen3.5:latest
 uv run python capture.py --summarize-url https://example.com/article
 
 # Different model
@@ -168,7 +168,7 @@ uv run python capture.py --summarize-url https://example.com/article --summarize
 uv run python capture.py --summarize-url https://example.com/article --voice am_adam --tts-speed 1.1
 ```
 
-**Requirements:** [Ollama](https://ollama.com) must be running locally (`ollama serve`) with the chosen model pulled (`ollama pull llama3.2`).
+**Requirements:** [Ollama](https://ollama.com) must be running locally (`ollama serve`) with the chosen model pulled (`ollama pull qwen3.5:latest`).
 
 **What happens:**
 1. Fetches the page headlessly and extracts readable text
@@ -302,7 +302,7 @@ uv run python capture.py --save-mp3 https://example.com/article --mp3-out chapte
 
 # ── Summarise & read ─────────────────────────────────────────────────────────
 
-# Summarise page with llama3.2, open in browser, speak aloud
+# Summarise page with qwen3.5:latest, open in browser, speak aloud
 uv run python capture.py --summarize-url https://example.com/article
 
 # Different Ollama model
@@ -361,7 +361,7 @@ uv run python capture.py --summarize-url https://example.com/article --summarize
 | Flag | Default | Description |
 |---|---|---|
 | `--summarize-url URL` | — | 🤖 Summarise URL with Ollama, then speak in browser reader |
-| `--summarize-model MODEL` | `llama3.2` | 🦙 Ollama model name |
+| `--summarize-model MODEL` | `qwen3.5:latest` | 🦙 Ollama model name |
 
 ---
 
